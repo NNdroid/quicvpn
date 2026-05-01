@@ -4,18 +4,24 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"flag"
 	"fmt"
 	"io"
 	"math/big"
+	mathrand "math/rand"
 	"net"
 	"os"
+	"os/signal"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -24,6 +30,10 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
+
+func init() {
+	mathrand.Seed(time.Now().UnixNano())
+}
 
 // ======================= 全局日志 =======================
 var log *zap.SugaredLogger
@@ -47,86 +57,136 @@ func fmtMAC(mac []byte) string {
 	return fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5])
 }
 
-// summarizeFrame 解析以太网帧并返回一个易读的摘要
-func summarizeFrame(frame []byte) string {
-	if len(frame) < 14 {
-		return fmt.Sprintf("Invalid Frame (len: %d)", len(frame))
-	}
-
-	dst := fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", frame[0], frame[1], frame[2], frame[3], frame[4], frame[5])
-	src := fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", frame[6], frame[7], frame[8], frame[9], frame[10], frame[11])
-	ethType := binary.BigEndian.Uint16(frame[12:14])
-
-	proto := "Unknown"
-	details := ""
-
-	switch ethType {
-	case 0x0806: // ARP
-		proto = "ARP"
-		if len(frame) >= 42 {
-			op := binary.BigEndian.Uint16(frame[20:22])
-			senderIP := net.IP(frame[28:32])
-			targetIP := net.IP(frame[38:42])
-			opStr := "Request"
-			if op == 2 {
-				opStr = "Reply"
-			}
-			details = fmt.Sprintf("[%s] %s -> %s", opStr, senderIP, targetIP)
-		}
-	case 0x0800: // IPv4
-		proto = "IPv4"
-		if len(frame) >= 34 {
-			ipProto := frame[23]
-			sIP := net.IP(frame[26:30])
-			dIP := net.IP(frame[30:34])
-			pName := fmt.Sprintf("Proto:%d", ipProto)
-			if ipProto == 1 {
-				pName = "ICMP"
-			} else if ipProto == 6 {
-				pName = "TCP"
-			} else if ipProto == 17 {
-				pName = "UDP"
-			}
-			details = fmt.Sprintf("[%s] %s -> %s", pName, sIP, dIP)
-		}
-	case 0x86dd: // IPv6
-		proto = "IPv6"
-	}
-
-	return fmt.Sprintf("%s | %s -> %s | %s", proto, src, dst, details)
+// ======================= 随机混淆生成器 =======================
+func generatePadding(min, max int) string {
+	length := mathrand.Intn(max-min+1) + min
+	b := make([]byte, length)
+	rand.Read(b)
+	return hex.EncodeToString(b)[:length]
 }
 
-// ======================= 自动生成内存 TLS 证书 =======================
-func generateTLSConfig() *tls.Config {
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		panic(err)
-	}
-	template := x509.Certificate{SerialNumber: big.NewInt(1)}
-	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
-	if err != nil {
-		panic(err)
-	}
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+// ======================= TLS 证书管理 (伪装 h3 ALPN) =======================
+func getServerTLSConfig(certFile, keyFile string) *tls.Config {
+	var cert tls.Certificate
+	var err error
 
-	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		panic(err)
+	if certFile != "" && keyFile != "" {
+		cert, err = tls.LoadX509KeyPair(certFile, keyFile)
+		if err != nil {
+			log.Fatalf("Failed to load custom TLS pair: %v", err)
+		}
+		log.Infof("Loaded custom TLS certificate: %s", certFile)
+	} else {
+		log.Infof("No cert/key specified. Generating ephemeral memory certificate...")
+		key, err := rsa.GenerateKey(rand.Reader, 2048)
+		if err != nil {
+			panic(err)
+		}
+		template := x509.Certificate{SerialNumber: big.NewInt(1)}
+		certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+		if err != nil {
+			panic(err)
+		}
+		keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+		certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+
+		cert, err = tls.X509KeyPair(certPEM, keyPEM)
+		if err != nil {
+			panic(err)
+		}
 	}
+
 	return &tls.Config{
-		Certificates: []tls.Certificate{tlsCert},
-		NextProtos:   []string{"tapvpn-quic"}, // ALPN 标识
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"h3", "h3-29"}, // HTTP/3 伪装
 	}
 }
 
-// ======================= 流式帧扫描器 (适配 io.Reader/Writer) =======================
+// ======================= 策略路由 (纯 Netlink 实现) =======================
+func setupPolicyRouting(tapName string, mark int, gwV4, gwV6 string) error {
+	if mark <= 0 {
+		return nil
+	}
+	link, err := netlink.LinkByName(tapName)
+	if err != nil {
+		return fmt.Errorf("failed to find tap dev %s: %v", tapName, err)
+	}
+
+	setup := func(gwStr string, family int) {
+		if gwStr == "" {
+			return
+		}
+		gw := net.ParseIP(gwStr)
+
+		rule := netlink.NewRule()
+		rule.Mark = uint32(mark)
+		rule.Table = mark
+		rule.Family = family
+		netlink.RuleDel(rule)
+		if err := netlink.RuleAdd(rule); err != nil {
+			log.Warnf("Failed to add rule for fwmark %d: %v", mark, err)
+		}
+
+		route := &netlink.Route{
+			LinkIndex: link.Attrs().Index,
+			Dst:       nil,
+			Gw:        gw,
+			Table:     mark,
+		}
+		if err := netlink.RouteReplace(route); err != nil {
+			log.Warnf("Failed to replace route in table %d: %v", mark, err)
+		}
+	}
+
+	setup(gwV4, netlink.FAMILY_V4)
+	setup(gwV6, netlink.FAMILY_V6)
+	log.Infof("🔀 Policy routing configured (fwmark: %d)", mark)
+	return nil
+}
+
+func cleanPolicyRouting(tapName string, mark int, gwV4, gwV6 string) {
+	if mark <= 0 {
+		return
+	}
+	link, err := netlink.LinkByName(tapName)
+	if err != nil {
+		return
+	}
+
+	cleanup := func(gwStr string, family int) {
+		if gwStr == "" {
+			return
+		}
+		gw := net.ParseIP(gwStr)
+
+		rule := netlink.NewRule()
+		rule.Mark = uint32(mark)
+		rule.Table = mark
+		rule.Family = family
+		netlink.RuleDel(rule)
+
+		route := &netlink.Route{
+			LinkIndex: link.Attrs().Index,
+			Dst:       nil,
+			Gw:        gw,
+			Table:     mark,
+		}
+		netlink.RouteDel(route)
+	}
+
+	cleanup(gwV4, netlink.FAMILY_V4)
+	cleanup(gwV6, netlink.FAMILY_V6)
+	log.Infof("🧹 Policy routing cleaned (fwmark: %d)", mark)
+}
+
+// ======================= 流式帧扫描器 =======================
 func writeStreamFrame(w io.Writer, frame []byte) error {
 	length := len(frame)
 	buf := make([]byte, 2+length)
 	binary.BigEndian.PutUint16(buf[:2], uint16(length))
-	copy(buf[2:], frame)
-	
+	if length > 0 {
+		copy(buf[2:], frame)
+	}
 	_, err := w.Write(buf)
 	return err
 }
@@ -147,18 +207,26 @@ func (fs *FrameScanner) ReadFrame() ([]byte, error) {
 	for {
 		if len(fs.buf) >= 2 {
 			length := int(binary.BigEndian.Uint16(fs.buf[:2]))
+
+			if length == 0 {
+				remaining := len(fs.buf) - 2
+				copy(fs.buf, fs.buf[2:])
+				fs.buf = fs.buf[:remaining]
+				continue
+			}
+
 			if length > 0 && length < 1600 {
 				if len(fs.buf) >= 2+length {
 					frame := make([]byte, length)
 					copy(frame, fs.buf[2:2+length])
-					
+
 					remaining := len(fs.buf) - (2 + length)
 					copy(fs.buf, fs.buf[2+length:])
 					fs.buf = fs.buf[:remaining]
 					return frame, nil
 				}
 			} else {
-				log.Warnf("[FrameScanner] CORRUPTION DETECTED: Invalid length %d. Dropping buffer.", length)
+				log.Warnf("[FrameScanner] CORRUPTION DETECTED: Invalid length %d.", length)
 				fs.buf = fs.buf[:0]
 			}
 		}
@@ -176,9 +244,10 @@ func (fs *FrameScanner) ReadFrame() ([]byte, error) {
 
 // ======================= 协议与配置 =======================
 type HandshakeReq struct {
-	PSK  string `json:"psk"`
-	IPv4 string `json:"ipv4,omitempty"`
-	IPv6 string `json:"ipv6,omitempty"`
+	PSK     string `json:"psk"`
+	IPv4    string `json:"ipv4,omitempty"`
+	IPv6    string `json:"ipv6,omitempty"`
+	Padding string `json:"padding,omitempty"`
 }
 
 type HandshakeResp struct {
@@ -186,6 +255,9 @@ type HandshakeResp struct {
 	Message string `json:"message"`
 	IPv4    string `json:"ipv4"`
 	IPv6    string `json:"ipv6"`
+	GwV4    string `json:"gw_v4,omitempty"`
+	GwV6    string `json:"gw_v6,omitempty"`
+	Padding string `json:"padding,omitempty"`
 }
 
 func main() {
@@ -197,22 +269,34 @@ func main() {
 
 	v4cidr := flag.String("v4cidr", "10.0.0.0/24", "IPv4 CIDR block (Server only)")
 	v6cidr := flag.String("v6cidr", "fd00::/64", "IPv6 CIDR block (Server only)")
+	certFile := flag.String("cert", "", "TLS Certificate file (Server only)")
+	keyFile := flag.String("key", "", "TLS Key file (Server only)")
 
 	reqV4 := flag.String("req-v4", "", "Requested IPv4 (Client only)")
 	reqV6 := flag.String("req-v6", "", "Requested IPv6 (Client only)")
+	sni := flag.String("sni", "www.cloudflare.com", "SNI for TLS (Client only)")
+	insecure := flag.Bool("insecure", false, "Skip TLS verify (Client only)")
+	certHash := flag.String("cert-sha256", "", "Verify server cert SHA256 (hex encoded) (Client only)")
+	
+	fwmark := flag.Int("fwmark", 0, "Enable policy routing with specified fwmark (e.g. 1911) (Client only)")
 
 	flag.Parse()
 	initLogger(*logLevel)
 	defer log.Sync()
 
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
 	if *mode == "server" {
-		startServer(*psk, *tapName, *addr, *v4cidr, *v6cidr)
+		startServer(ctx, *psk, *tapName, *addr, *v4cidr, *v6cidr, *certFile, *keyFile)
 	} else if *mode == "client" {
-		startClient(*psk, *tapName, *addr, *reqV4, *reqV6)
+		startClient(ctx, *psk, *tapName, *addr, *reqV4, *reqV6, *sni, *insecure, *certHash, *fwmark)
 	} else {
-		fmt.Println("Usage: go run main.go -mode server|client")
+		fmt.Println("Usage: go run main.go -mode server|client [flags...]")
 		os.Exit(1)
 	}
+	
+	log.Info("Program exited gracefully.")
 }
 
 // ======================= VSwitch 虚拟交换机 =======================
@@ -243,7 +327,7 @@ func (vs *VSwitch) AddPort(p Port) {
 	vs.mu.Lock()
 	defer vs.mu.Unlock()
 	vs.ports[p.ID()] = p
-	log.Infof("[VSwitch] Port UP: %s", p.ID())
+	log.Debugf("[VSwitch] Port UP: %s", p.ID())
 }
 
 func (vs *VSwitch) RemovePort(portID string) {
@@ -255,7 +339,7 @@ func (vs *VSwitch) RemovePort(portID string) {
 			delete(vs.macTable, mac)
 		}
 	}
-	log.Infof("[VSwitch] Port DOWN: %s", portID)
+	log.Debugf("[VSwitch] Port DOWN: %s", portID)
 }
 
 func (vs *VSwitch) ProcessFrame(srcPortID string, frame []byte) {
@@ -319,14 +403,18 @@ type AsyncPort struct {
 	id     string
 	ch     chan []byte
 	writer func([]byte) error
-	closed bool
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
-func NewAsyncPort(id string, writer func([]byte) error) *AsyncPort {
+func NewAsyncPort(ctx context.Context, id string, writer func([]byte) error) *AsyncPort {
+	pCtx, pCancel := context.WithCancel(ctx)
 	p := &AsyncPort{
 		id:     id,
 		ch:     make(chan []byte, 4096),
 		writer: writer,
+		ctx:    pCtx,
+		cancel: pCancel,
 	}
 	go p.run()
 	return p
@@ -335,11 +423,17 @@ func NewAsyncPort(id string, writer func([]byte) error) *AsyncPort {
 func (p *AsyncPort) ID() string { return p.id }
 
 func (p *AsyncPort) WriteFrame(frame []byte) error {
-	if p.closed {
-		return nil
+	select {
+	case <-p.ctx.Done():
+		return fmt.Errorf("port %s closed", p.id)
+	default:
 	}
-	buf := make([]byte, len(frame))
-	copy(buf, frame)
+
+	var buf []byte
+	if frame != nil {
+		buf = make([]byte, len(frame))
+		copy(buf, frame)
+	}
 	select {
 	case p.ch <- buf:
 	default:
@@ -349,16 +443,20 @@ func (p *AsyncPort) WriteFrame(frame []byte) error {
 }
 
 func (p *AsyncPort) run() {
-	for frame := range p.ch {
-		if err := p.writer(frame); err != nil {
-			log.Debugf("[AsyncPort %s] Writer returned error: %v", p.id, err)
+	for {
+		select {
+		case <-p.ctx.Done():
+			return
+		case frame := <-p.ch:
+			if err := p.writer(frame); err != nil {
+				log.Debugf("[AsyncPort %s] Writer returned error: %v", p.id, err)
+			}
 		}
 	}
 }
 
 func (p *AsyncPort) Close() {
-	p.closed = true
-	close(p.ch)
+	p.cancel()
 }
 
 // ======================= 服务端实现 =======================
@@ -366,6 +464,8 @@ type Server struct {
 	psk     string
 	v4Net   *net.IPNet
 	v6Net   *net.IPNet
+	v4Gw    string 
+	v6Gw    string 
 	usedV4  map[string]bool
 	usedV6  map[string]bool
 	mu      sync.Mutex
@@ -373,8 +473,8 @@ type Server struct {
 	vswitch *VSwitch
 }
 
-func startServer(psk, tapName, addr, v4cidr, v6cidr string) {
-	log.Infof("Starting QUIC server process...")
+func startServer(ctx context.Context, psk, tapName, addr, v4cidr, v6cidr, certFile, keyFile string) {
+	log.Infof("Starting QUIC server process... (HTTP/3 Camouflage Active)")
 	_, v4net, _ := net.ParseCIDR(v4cidr)
 	_, v6net, _ := net.ParseCIDR(v6cidr)
 
@@ -389,8 +489,11 @@ func startServer(psk, tapName, addr, v4cidr, v6cidr string) {
 
 	srvV4IP := getFirstIP(v4net)
 	srvV6IP := getFirstIP(v6net)
-	srv.usedV4[srvV4IP.String()] = true
-	srv.usedV6[srvV6IP.String()] = true
+	srv.v4Gw = srvV4IP.String()
+	srv.v6Gw = srvV6IP.String()
+	
+	srv.usedV4[srv.v4Gw] = true
+	srv.usedV6[srv.v6Gw] = true
 
 	config := water.Config{DeviceType: water.TAP}
 	config.Name = tapName
@@ -401,88 +504,117 @@ func startServer(psk, tapName, addr, v4cidr, v6cidr string) {
 	srv.tap = tap
 
 	if link, err := netlink.LinkByName(tapName); err == nil {
-		v4Addr, _ := netlink.ParseAddr(fmt.Sprintf("%s/%d", srvV4IP.String(), maskSize(v4net.Mask)))
+		// 服务端同时配置 IPv4 和 IPv6 地址
+		v4Addr, _ := netlink.ParseAddr(fmt.Sprintf("%s/%d", srv.v4Gw, maskSize(v4net.Mask)))
 		netlink.AddrReplace(link, v4Addr)
+
+		v6Addr, _ := netlink.ParseAddr(fmt.Sprintf("%s/%d", srv.v6Gw, maskSize(v6net.Mask)))
+		netlink.AddrReplace(link, v6Addr)
+
 		netlink.LinkSetUp(link)
-		log.Infof("Server TAP configured: %s", v4Addr.String())
+		log.Infof("Server TAP configured: IPv4=%s, IPv6=%s", v4Addr.String(), v6Addr.String())
+	} else {
+		log.Errorf("Failed to configure Server TAP interface: %v", err)
 	}
 
+	go func() {
+		<-ctx.Done()
+		log.Info("Context canceled, closing TAP interface to unblock listeners...")
+		srv.tap.Close()
+	}()
+
 	tapPortID := "TAP_LOCAL"
-	tapPort := NewAsyncPort(tapPortID, func(b []byte) error {
-		_, err := srv.tap.Write(b)
-		return err
+	tapPort := NewAsyncPort(ctx, tapPortID, func(b []byte) error {
+		if len(b) > 0 {
+			_, err := srv.tap.Write(b)
+			return err
+		}
+		return nil
 	})
 	srv.vswitch.AddPort(tapPort)
 
 	go func() {
 		buf := make([]byte, 65536)
 		for {
-			n, err := srv.tap.Read(buf)
-			if err != nil {
-				log.Fatalf("[Server Local] TAP Read error: %v", err)
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				n, err := srv.tap.Read(buf)
+				if err != nil {
+					if ctx.Err() != nil { return }
+					log.Errorf("[Server Local] TAP Read error: %v", err)
+					return
+				}
+				frame := buf[:n]
+				if len(frame) < 60 {
+					padded := make([]byte, 60)
+					copy(padded, frame)
+					frame = padded
+				}
+				srv.vswitch.ProcessFrame(tapPortID, frame)
 			}
-			frame := buf[:n]
-			if len(frame) < 60 {
-				padded := make([]byte, 60)
-				copy(padded, frame)
-				frame = padded
-			}
-			srv.vswitch.ProcessFrame(tapPortID, frame)
 		}
 	}()
 
-	// ==================== 启动 QUIC 监听 ====================
 	quicConfig := &quic.Config{
-		KeepAlivePeriod: 10 * time.Second, // 保持连接活跃，支持完美的连接迁移
-		MaxIdleTimeout:  5 * time.Minute,
+		KeepAlivePeriod: 15 * time.Second,
+		MaxIdleTimeout:  30 * time.Second, // 大幅缩短假死探测时间
 	}
 
-	listener, err := quic.ListenAddr(addr, generateTLSConfig(), quicConfig)
+	tlsConfig := getServerTLSConfig(certFile, keyFile)
+	listener, err := quic.ListenAddr(addr, tlsConfig, quicConfig)
 	if err != nil {
 		log.Fatalf("QUIC Listen error: %v", err)
 	}
-	log.Infof("VPN Server running and listening on %s (QUIC UDP)", addr)
+	log.Infof("VPN Server listening on %s (Looks like standard HTTP/3 traffic)", addr)
+
+	go func() {
+		<-ctx.Done()
+		listener.Close()
+	}()
 
 	for {
-		// 最新版 quic.ListenAddr 返回的 listener 拥有 Accept 结构体方法，并且直接返回 *quic.Conn 
-		conn, err := listener.Accept(context.Background())
+		conn, err := listener.Accept(ctx)
 		if err != nil {
+			if ctx.Err() != nil {
+				log.Info("Server listener closed by context.")
+				break
+			}
 			log.Warnf("QUIC Accept error: %v", err)
 			continue
 		}
-		log.Infof("Accepted new QUIC connection from %s", conn.RemoteAddr().String())
 		
-		// 纯净调用：不加任何断言
 		go func(c *quic.Conn) {
-			stream, err := c.AcceptStream(context.Background()) // 直接返回 *quic.Stream
+			stream, err := c.AcceptStream(ctx)
 			if err != nil {
-				log.Warnf("Failed to accept QUIC Stream: %v", err)
+				log.Debugf("Failed to accept QUIC Stream: %v", err)
 				return
 			}
-			srv.handleClient(c, stream)
-		}(conn) 
+			srv.handleClient(ctx, c, stream)
+		}(conn)
 	}
 }
 
-// 纯净声明：直接接收最新的结构体指针
-func (s *Server) handleClient(conn *quic.Conn, stream *quic.Stream) {
+func (s *Server) handleClient(parentCtx context.Context, conn *quic.Conn, stream *quic.Stream) {
+	connCtx, cancel := context.WithCancel(parentCtx)
+	defer cancel()
 	defer conn.CloseWithError(0, "Closed intentionally")
-	clientID := conn.RemoteAddr().String()
 
+	clientID := conn.RemoteAddr().String()
 	scanner := NewFrameScanner(stream)
 
 	stream.SetReadDeadline(time.Now().Add(5 * time.Second))
 	reqData, err := scanner.ReadFrame()
 	if err != nil {
-		log.Warnf("[%s] Handshake read error: %v", clientID, err)
+		log.Debugf("[%s] Stream read error: %v", clientID, err)
 		return
 	}
 	stream.SetReadDeadline(time.Time{})
 
 	var req HandshakeReq
 	if err := json.Unmarshal(reqData, &req); err != nil || req.PSK != s.psk {
-		log.Warnf("[%s] PSK Mismatch! Connection rejected.", clientID)
-		s.sendResp(stream, false, "Auth failed", "", "")
+		log.Warnf("[%s] Auth failed or invalid request. Dropping silently.", clientID)
 		return
 	}
 
@@ -498,23 +630,41 @@ func (s *Server) handleClient(conn *quic.Conn, stream *quic.Stream) {
 
 	v4cidr := fmt.Sprintf("%s/%d", v4ip, maskSize(s.v4Net.Mask))
 	v6cidr := fmt.Sprintf("%s/%d", v6ip, maskSize(s.v6Net.Mask))
+	
 	s.sendResp(stream, true, "OK", v4cidr, v6cidr)
 	
-	log.Infof("[%s] Handshake OK. Assigned: %s", clientID, v4cidr)
+	log.Infof("[%s] Tunnel established. Assigned V4: %s | V6: %s", clientID, v4cidr, v6cidr)
 
-	clientPort := NewAsyncPort(clientID, func(b []byte) error {
+	clientPort := NewAsyncPort(connCtx, clientID, func(b []byte) error {
 		return writeStreamFrame(stream, b)
 	})
 	s.vswitch.AddPort(clientPort)
 	defer clientPort.Close()
 
-	for {
-		frame, err := scanner.ReadFrame()
-		if err != nil {
-			log.Infof("[%s] QUIC Stream closed: %v", clientID, err)
-			break
+	go func() {
+		for {
+			jitterDelay := time.Duration(mathrand.Intn(3000)+4000) * time.Millisecond
+			select {
+			case <-connCtx.Done():
+				return
+			case <-time.After(jitterDelay):
+				clientPort.WriteFrame(nil) // 心跳帧
+			}
 		}
-		s.vswitch.ProcessFrame(clientID, frame)
+	}()
+
+	for {
+		select {
+		case <-connCtx.Done():
+			return
+		default:
+			frame, err := scanner.ReadFrame()
+			if err != nil {
+				log.Debugf("[%s] Tunnel stream closed: %v", clientID, err)
+				return
+			}
+			s.vswitch.ProcessFrame(clientID, frame)
+		}
 	}
 }
 
@@ -522,6 +672,7 @@ func (s *Server) assignIPs(reqV4, reqV6 string) (string, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	alloc := func(req string, netw *net.IPNet, used map[string]bool) string {
+		req = strings.Split(req, "/")[0]
 		parsed := net.ParseIP(req)
 		if parsed != nil && netw.Contains(parsed) && !used[parsed.String()] {
 			used[parsed.String()] = true
@@ -541,8 +692,16 @@ func (s *Server) assignIPs(reqV4, reqV6 string) (string, string) {
 	return alloc(reqV4, s.v4Net, s.usedV4), alloc(reqV6, s.v6Net, s.usedV6)
 }
 
-func (s *Server) sendResp(w io.Writer, ok bool, msg, v4, v6 string) {
-	d, _ := json.Marshal(HandshakeResp{Success: ok, Message: msg, IPv4: v4, IPv6: v6})
+func (s *Server) sendResp(w io.Writer, ok bool, msg, v4cidr, v6cidr string) {
+	d, _ := json.Marshal(HandshakeResp{
+		Success: ok, 
+		Message: msg, 
+		IPv4:    v4cidr, 
+		IPv6:    v6cidr,
+		GwV4:    s.v4Gw, 
+		GwV6:    s.v6Gw,
+		Padding: generatePadding(100, 500), 
+	})
 	writeStreamFrame(w, d)
 }
 
@@ -553,11 +712,16 @@ type Client struct {
 	tapName    string
 	reqV4      string
 	reqV6      string
+	sni        string
+	insecure   bool
+	certHash   string
+	fwmark     int
 	tap        *water.Interface
+	tapTxChan  chan []byte // 全局发送通道，防止协程泄漏
 }
 
-func startClient(psk, tapName, addr, reqV4, reqV6 string) {
-	log.Infof("Starting QUIC client process...")
+func startClient(ctx context.Context, psk, tapName, addr, reqV4, reqV6, sni string, insecure bool, certHash string, fwmark int) {
+	log.Infof("Starting QUIC client process... (HTTP/3 Camouflage Active)")
 	config := water.Config{DeviceType: water.TAP}
 	config.Name = tapName
 	iface, err := water.New(config)
@@ -565,57 +729,130 @@ func startClient(psk, tapName, addr, reqV4, reqV6 string) {
 		log.Fatalf("Client TAP creation error: %v", err)
 	}
 
+	go func() {
+		<-ctx.Done()
+		log.Info("Context canceled, closing local TAP interface...")
+		iface.Close()
+	}()
+
 	c := &Client{
 		psk:        psk,
 		serverAddr: addr,
 		tapName:    tapName,
 		reqV4:      reqV4,
 		reqV6:      reqV6,
+		sni:        sni,
+		insecure:   insecure,
+		certHash:   certHash,
+		fwmark:     fwmark,
 		tap:        iface,
+		tapTxChan:  make(chan []byte, 4096),
 	}
 
+	// 唯一常驻读取协程，断线重连也不会泄漏
+	go func() {
+		buf := make([]byte, 65536)
+		for {
+			rn, err := iface.Read(buf)
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				log.Errorf("[Tunnel] TAP Read Error: %v", err)
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			frame := make([]byte, rn)
+			copy(frame, buf[:rn])
+
+			if len(frame) < 60 {
+				padded := make([]byte, 60)
+				copy(padded, frame)
+				frame = padded
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case c.tapTxChan <- frame:
+			default:
+				// 背压防爆
+			}
+		}
+	}()
+
 	for {
-		err := c.dialAndServe()
-		log.Warnf("Tunnel down: %v. Reconnecting in 3s...", err)
-		time.Sleep(3 * time.Second)
+		select {
+		case <-ctx.Done():
+			log.Info("Client shutdown loop finished.")
+			return
+		default:
+			err := c.dialAndServe(ctx)
+			log.Warnf("Tunnel down: %v. Reconnecting in 3s...", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(3 * time.Second):
+			}
+		}
 	}
 }
 
-func (c *Client) dialAndServe() error {
-	// ==================== QUIC 拨号 ====================
+func (c *Client) dialAndServe(parentCtx context.Context) error {
+	runCtx, runCancel := context.WithCancel(parentCtx)
+	defer runCancel()
+
 	tlsConf := &tls.Config{
-		InsecureSkipVerify: true,             // 忽略证书校验
-		NextProtos:         []string{"tapvpn-quic"},
-	}
-	quicConfig := &quic.Config{
-		KeepAlivePeriod: 10 * time.Second, // 支持连接迁移不断线
-		MaxIdleTimeout:  5 * time.Minute,
+		ServerName:         c.sni,
+		InsecureSkipVerify: c.insecure,
+		NextProtos:         []string{"h3"},
 	}
 
-	log.Infof("Initiating QUIC dial to Server: %s", c.serverAddr)
+	if c.certHash != "" {
+		tlsConf.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+			if len(rawCerts) == 0 {
+				return fmt.Errorf("no certificates provided by server")
+			}
+			hash := sha256.Sum256(rawCerts[0])
+			hashStr := hex.EncodeToString(hash[:])
+			if hashStr != c.certHash {
+				return fmt.Errorf("cert SHA-256 mismatch. Expected %s, got %s", c.certHash, hashStr)
+			}
+			return nil
+		}
+	}
+
+	quicConfig := &quic.Config{
+		KeepAlivePeriod: 15 * time.Second,
+		MaxIdleTimeout:  30 * time.Second,
+	}
+
+	log.Infof("Initiating connection to Server: %s (SNI: %s)", c.serverAddr, c.sni)
 	
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	dialCtx, dialCancel := context.WithTimeout(runCtx, 5*time.Second)
+	conn, err := quic.DialAddr(dialCtx, c.serverAddr, tlsConf, quicConfig)
+	dialCancel()
 	
-	// 最新版直接返回 *quic.Conn，干净清爽
-	conn, err := quic.DialAddr(ctx, c.serverAddr, tlsConf, quicConfig)
 	if err != nil {
 		return fmt.Errorf("QUIC dial failed: %v", err)
 	}
 	defer conn.CloseWithError(0, "Client closed")
 	
-	log.Infof("QUIC tunnel established to %s. Connection Migration ready.", c.serverAddr)
+	log.Infof("Encrypted transport established to %s.", c.serverAddr)
 
-	// 最新版直接返回 *quic.Stream，干净清爽
-	stream, err := conn.OpenStreamSync(context.Background())
+	stream, err := conn.OpenStreamSync(runCtx)
 	if err != nil {
 		return fmt.Errorf("failed to open QUIC stream: %v", err)
 	}
 
 	scanner := NewFrameScanner(stream)
 
-	// 握手
-	req := HandshakeReq{PSK: c.psk, IPv4: c.reqV4, IPv6: c.reqV6}
+	req := HandshakeReq{
+		PSK:     c.psk, 
+		IPv4:    c.reqV4, 
+		IPv6:    c.reqV6,
+		Padding: generatePadding(100, 500), 
+	}
 	reqData, _ := json.Marshal(req)
 	if err := writeStreamFrame(stream, reqData); err != nil {
 		return fmt.Errorf("failed to send handshake: %v", err)
@@ -633,67 +870,72 @@ func (c *Client) dialAndServe() error {
 		return fmt.Errorf("handshake failed/rejected: %v", err)
 	}
 
-	log.Infof("Handshake OK! Assigned: %s", resp.IPv4)
+	log.Infof("Tunnel negotiated! IPv4: %s (GW: %s) | IPv6: %s (GW: %s)", resp.IPv4, resp.GwV4, resp.IPv6, resp.GwV6)
 
 	if err := c.setupInterface(resp.IPv4, resp.IPv6); err != nil {
 		return fmt.Errorf("TAP interface setup failed: %v", err)
 	}
 
+	if err := setupPolicyRouting(c.tapName, c.fwmark, resp.GwV4, resp.GwV6); err != nil {
+		log.Warnf("Policy routing setup failed: %v", err)
+	}
+	defer cleanPolicyRouting(c.tapName, c.fwmark, resp.GwV4, resp.GwV6)
+
 	errChan := make(chan error, 2)
 
-	// TAP -> QUIC Stream
 	go func() {
-		buf := make([]byte, 65536)
-		frameIdx := 0
 		for {
-			rn, err := c.tap.Read(buf)
-			if err != nil {
-				log.Errorf("[Tunnel] TAP Read Error: %v", err)
-				errChan <- err
-				return
-			}
-			frameIdx++
-			frame := buf[:rn]
-
-			if len(frame) < 60 {
-				padded := make([]byte, 60)
-				copy(padded, frame)
-				frame = padded
-			}
+			jitterDelay := time.Duration(mathrand.Intn(3000)+4000) * time.Millisecond
 			
-			if err := writeStreamFrame(stream, frame); err != nil {
-				log.Errorf("[Tx-#%d] QUIC Write Error: %v", frameIdx, err)
-				errChan <- err
+			select {
+			case <-runCtx.Done():
 				return
+			case frame := <-c.tapTxChan: // 从全局缓冲池取网卡包发送
+				if err := writeStreamFrame(stream, frame); err != nil {
+					log.Debugf("[Tx] QUIC Write Error: %v", err)
+					errChan <- err
+					return
+				}
+			case <-time.After(jitterDelay):
+				if err := writeStreamFrame(stream, nil); err != nil {
+					log.Debugf("[Tx] Keep-alive Write Error: %v", err)
+					errChan <- err
+					return
+				}
 			}
 		}
 	}()
 
-	// QUIC Stream -> TAP
 	go func() {
-		frameIdx := 0
 		for {
-			frame, err := scanner.ReadFrame()
-			if err != nil {
-				log.Errorf("[Rx] QUIC Read Error: %v", err)
-				errChan <- err
+			select {
+			case <-runCtx.Done():
 				return
-			}
-			frameIdx++
-			
-			summary := summarizeFrame(frame)
-			log.Debugf("[Rx-#%d] Received from tunnel: %d bytes | %s", frameIdx, len(frame), summary)
-
-			if _, err := c.tap.Write(frame); err != nil {
-				log.Errorf("[Rx-#%d] TAP Write Error: %v", frameIdx, err)
-				errChan <- err
-				return
+			default:
+				frame, err := scanner.ReadFrame()
+				if err != nil {
+					log.Debugf("[Rx] Tunnel stream closed: %v", err)
+					errChan <- err
+					return
+				}
+				
+				if _, err := c.tap.Write(frame); err != nil {
+					log.Errorf("[Rx] TAP Write Error: %v", err)
+					errChan <- err
+					return
+				}
 			}
 		}
 	}()
 
-	log.Infof("QUIC Tunnel Data Plane is Active. Try switching Wi-Fi/Cellular to test Connection Migration!")
-	return <-errChan
+	log.Infof("QUIC Tunnel Data Plane Active.")
+	
+	select {
+	case err := <-errChan:
+		return err
+	case <-runCtx.Done():
+		return nil
+	}
 }
 
 func (c *Client) setupInterface(v4cidr, v6cidr string) error {
