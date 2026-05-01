@@ -57,7 +57,51 @@ func fmtMAC(mac []byte) string {
 	return fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5])
 }
 
-// ======================= 随机混淆生成器 =======================
+// ======================= 内存池优化 (sync.Pool) =======================
+// framePool 提供 MTU 安全大小的字节切片，减少 GC 压力
+var framePool = sync.Pool{
+	New: func() any {
+		return make([]byte, 2048)
+	},
+}
+
+// getFrame 从池中获取切片
+func getFrame() []byte {
+	return framePool.Get().([]byte)
+}
+
+// putFrame 用完后归还切片
+func putFrame(b []byte) {
+	if cap(b) >= 1500 && cap(b) <= 65536 {
+		framePool.Put(b[:cap(b)])
+	}
+}
+
+// ======================= 动态流量特征混淆 =======================
+// buildPaddedFrame 小包膨胀，中包加扰，大包放行 (Zero-allocation 填充)
+func buildPaddedFrame(buf []byte, rn int) []byte {
+	targetLen := rn
+
+	if rn < 600 {
+		// 小于 600 的包：随机填充到 600 ~ 900 字节
+		targetLen = mathrand.Intn(301) + 600
+	} else if rn <= 900 {
+		// 600 到 900 的包：追加 64 ~ 256 字节的随机噪声长度
+		targetLen = rn + mathrand.Intn(193) + 64
+	}
+
+	frame := getFrame()[:targetLen]
+	copy(frame, buf[:rn])
+
+	if targetLen > rn {
+		for i := rn; i < targetLen; i++ {
+			frame[i] = 0 // QUIC 会将其加密为完美随机密文
+		}
+	}
+
+	return frame
+}
+
 func generatePadding(min, max int) string {
 	length := mathrand.Intn(max-min+1) + min
 	b := make([]byte, length)
@@ -182,12 +226,22 @@ func cleanPolicyRouting(tapName string, mark int, gwV4, gwV6 string) {
 // ======================= 流式帧扫描器 =======================
 func writeStreamFrame(w io.Writer, frame []byte) error {
 	length := len(frame)
-	buf := make([]byte, 2+length)
-	binary.BigEndian.PutUint16(buf[:2], uint16(length))
-	if length > 0 {
-		copy(buf[2:], frame)
+	
+	streamBuf := getFrame()
+	defer putFrame(streamBuf)
+
+	if 2+length > cap(streamBuf) {
+		streamBuf = make([]byte, 2+length)
+	} else {
+		streamBuf = streamBuf[:2+length]
 	}
-	_, err := w.Write(buf)
+
+	binary.BigEndian.PutUint16(streamBuf[:2], uint16(length))
+	if length > 0 {
+		copy(streamBuf[2:], frame)
+	}
+	
+	_, err := w.Write(streamBuf)
 	return err
 }
 
@@ -217,7 +271,7 @@ func (fs *FrameScanner) ReadFrame() ([]byte, error) {
 
 			if length > 0 && length < 1600 {
 				if len(fs.buf) >= 2+length {
-					frame := make([]byte, length)
+					frame := getFrame()[:length]
 					copy(frame, fs.buf[2:2+length])
 
 					remaining := len(fs.buf) - (2 + length)
@@ -231,13 +285,48 @@ func (fs *FrameScanner) ReadFrame() ([]byte, error) {
 			}
 		}
 
-		temp := make([]byte, 65536)
+		temp := getFrame()
 		n, err := fs.r.Read(temp)
+		if n > 0 {
+			fs.buf = append(fs.buf, temp[:n]...)
+		}
+		putFrame(temp)
+		
 		if err != nil {
 			return nil, err
 		}
-		if n > 0 {
-			fs.buf = append(fs.buf, temp[:n]...)
+	}
+}
+
+// 焦油坑主动探测伪装防御
+func camouflageProbe(stream *quic.Stream) {
+	defer stream.Close()
+	junkBuf := getFrame()
+	defer putFrame(junkBuf)
+	
+	deadline := time.Now().Add(10 * time.Second)
+	stream.SetReadDeadline(deadline)
+
+	for {
+		_, err := stream.Read(junkBuf)
+		if err != nil {
+			return 
+		}
+
+		time.Sleep(time.Duration(mathrand.Intn(150)+50) * time.Millisecond)
+
+		fakePayloadLen := mathrand.Intn(300) + 100
+		fakeFrame := getFrame()[:fakePayloadLen+2]
+		
+		fakeFrame[0] = 0x00 
+		fakeFrame[1] = byte(fakePayloadLen)
+		rand.Read(fakeFrame[2:])
+
+		stream.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		_, err = stream.Write(fakeFrame)
+		putFrame(fakeFrame)
+		if err != nil {
+			return
 		}
 	}
 }
@@ -431,13 +520,17 @@ func (p *AsyncPort) WriteFrame(frame []byte) error {
 
 	var buf []byte
 	if frame != nil {
-		buf = make([]byte, len(frame))
+		buf = getFrame()[:len(frame)]
 		copy(buf, frame)
 	}
+	
 	select {
 	case p.ch <- buf:
 	default:
-		log.Warnf("[AsyncPort %s] BACKPRESSURE! Queue full", p.id)
+		log.Warnf("[AsyncPort %s] BACKPRESSURE! Queue full, dropping frame.", p.id)
+		if buf != nil {
+			putFrame(buf)
+		}
 	}
 	return nil
 }
@@ -450,6 +543,9 @@ func (p *AsyncPort) run() {
 		case frame := <-p.ch:
 			if err := p.writer(frame); err != nil {
 				log.Debugf("[AsyncPort %s] Writer returned error: %v", p.id, err)
+			}
+			if frame != nil {
+				putFrame(frame)
 			}
 		}
 	}
@@ -504,7 +600,6 @@ func startServer(ctx context.Context, psk, tapName, addr, v4cidr, v6cidr, certFi
 	srv.tap = tap
 
 	if link, err := netlink.LinkByName(tapName); err == nil {
-		// 服务端同时配置 IPv4 和 IPv6 地址
 		v4Addr, _ := netlink.ParseAddr(fmt.Sprintf("%s/%d", srv.v4Gw, maskSize(v4net.Mask)))
 		netlink.AddrReplace(link, v4Addr)
 
@@ -533,6 +628,7 @@ func startServer(ctx context.Context, psk, tapName, addr, v4cidr, v6cidr, certFi
 	})
 	srv.vswitch.AddPort(tapPort)
 
+	// 服务端本地 TAP 读取循环
 	go func() {
 		buf := make([]byte, 65536)
 		for {
@@ -540,26 +636,25 @@ func startServer(ctx context.Context, psk, tapName, addr, v4cidr, v6cidr, certFi
 			case <-ctx.Done():
 				return
 			default:
-				n, err := srv.tap.Read(buf)
+				rn, err := srv.tap.Read(buf)
 				if err != nil {
 					if ctx.Err() != nil { return }
 					log.Errorf("[Server Local] TAP Read error: %v", err)
 					return
 				}
-				frame := buf[:n]
-				if len(frame) < 60 {
-					padded := make([]byte, 60)
-					copy(padded, frame)
-					frame = padded
-				}
+				
+				// 调用基于规则的特征混淆填充
+				frame := buildPaddedFrame(buf, rn)
+				
 				srv.vswitch.ProcessFrame(tapPortID, frame)
+				putFrame(frame)
 			}
 		}
 	}()
 
 	quicConfig := &quic.Config{
 		KeepAlivePeriod: 15 * time.Second,
-		MaxIdleTimeout:  30 * time.Second, // 大幅缩短假死探测时间
+		MaxIdleTimeout:  30 * time.Second,
 	}
 
 	tlsConfig := getServerTLSConfig(certFile, keyFile)
@@ -607,16 +702,20 @@ func (s *Server) handleClient(parentCtx context.Context, conn *quic.Conn, stream
 	stream.SetReadDeadline(time.Now().Add(5 * time.Second))
 	reqData, err := scanner.ReadFrame()
 	if err != nil {
-		log.Debugf("[%s] Stream read error: %v", clientID, err)
+		log.Debugf("[%s] Stream read error or probe detected: %v", clientID, err)
+		camouflageProbe(stream)
 		return
 	}
 	stream.SetReadDeadline(time.Time{})
 
 	var req HandshakeReq
 	if err := json.Unmarshal(reqData, &req); err != nil || req.PSK != s.psk {
-		log.Warnf("[%s] Auth failed or invalid request. Dropping silently.", clientID)
+		log.Warnf("[%s] Auth failed. Entering camouflage tarpit.", clientID)
+		putFrame(reqData)
+		camouflageProbe(stream)
 		return
 	}
+	putFrame(reqData)
 
 	v4ip, v6ip := s.assignIPs(req.IPv4, req.IPv6)
 
@@ -648,7 +747,7 @@ func (s *Server) handleClient(parentCtx context.Context, conn *quic.Conn, stream
 			case <-connCtx.Done():
 				return
 			case <-time.After(jitterDelay):
-				clientPort.WriteFrame(nil) // 心跳帧
+				clientPort.WriteFrame(nil)
 			}
 		}
 	}()
@@ -664,6 +763,7 @@ func (s *Server) handleClient(parentCtx context.Context, conn *quic.Conn, stream
 				return
 			}
 			s.vswitch.ProcessFrame(clientID, frame)
+			putFrame(frame)
 		}
 	}
 }
@@ -717,7 +817,7 @@ type Client struct {
 	certHash   string
 	fwmark     int
 	tap        *water.Interface
-	tapTxChan  chan []byte // 全局发送通道，防止协程泄漏
+	tapTxChan  chan []byte
 }
 
 func startClient(ctx context.Context, psk, tapName, addr, reqV4, reqV6, sni string, insecure bool, certHash string, fwmark int) {
@@ -749,7 +849,7 @@ func startClient(ctx context.Context, psk, tapName, addr, reqV4, reqV6, sni stri
 		tapTxChan:  make(chan []byte, 4096),
 	}
 
-	// 唯一常驻读取协程，断线重连也不会泄漏
+	// 客户端唯一常驻读取协程
 	go func() {
 		buf := make([]byte, 65536)
 		for {
@@ -762,21 +862,17 @@ func startClient(ctx context.Context, psk, tapName, addr, reqV4, reqV6, sni stri
 				time.Sleep(1 * time.Second)
 				continue
 			}
-			frame := make([]byte, rn)
-			copy(frame, buf[:rn])
-
-			if len(frame) < 60 {
-				padded := make([]byte, 60)
-				copy(padded, frame)
-				frame = padded
-			}
+			
+			// 调用基于规则的特征混淆填充
+			frame := buildPaddedFrame(buf, rn)
 
 			select {
 			case <-ctx.Done():
+				putFrame(frame)
 				return
 			case c.tapTxChan <- frame:
 			default:
-				// 背压防爆
+				putFrame(frame)
 			}
 		}
 	}()
@@ -824,7 +920,7 @@ func (c *Client) dialAndServe(parentCtx context.Context) error {
 
 	quicConfig := &quic.Config{
 		KeepAlivePeriod: 15 * time.Second,
-		MaxIdleTimeout:  30 * time.Second,
+		MaxIdleTimeout:  30 * time.Second, 
 	}
 
 	log.Infof("Initiating connection to Server: %s (SNI: %s)", c.serverAddr, c.sni)
@@ -867,8 +963,10 @@ func (c *Client) dialAndServe(parentCtx context.Context) error {
 
 	var resp HandshakeResp
 	if err := json.Unmarshal(respData, &resp); err != nil || !resp.Success {
+		putFrame(respData)
 		return fmt.Errorf("handshake failed/rejected: %v", err)
 	}
+	putFrame(respData)
 
 	log.Infof("Tunnel negotiated! IPv4: %s (GW: %s) | IPv6: %s (GW: %s)", resp.IPv4, resp.GwV4, resp.IPv6, resp.GwV6)
 
@@ -890,8 +988,10 @@ func (c *Client) dialAndServe(parentCtx context.Context) error {
 			select {
 			case <-runCtx.Done():
 				return
-			case frame := <-c.tapTxChan: // 从全局缓冲池取网卡包发送
-				if err := writeStreamFrame(stream, frame); err != nil {
+			case frame := <-c.tapTxChan: 
+				err := writeStreamFrame(stream, frame)
+				putFrame(frame)
+				if err != nil {
 					log.Debugf("[Tx] QUIC Write Error: %v", err)
 					errChan <- err
 					return
@@ -921,9 +1021,11 @@ func (c *Client) dialAndServe(parentCtx context.Context) error {
 				
 				if _, err := c.tap.Write(frame); err != nil {
 					log.Errorf("[Rx] TAP Write Error: %v", err)
+					putFrame(frame)
 					errChan <- err
 					return
 				}
+				putFrame(frame)
 			}
 		}
 	}()
