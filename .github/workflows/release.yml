@@ -1,0 +1,141 @@
+name: Build and Release Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release Tag Name (e.g. v1.0.20260730)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Publish Release Assets
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          check-latest: true
+
+      - name: Run Unit Tests
+        run: |
+          go test -v ./...
+
+      - name: Determine Version and Build Binaries
+        run: |
+          mkdir -p release_assets
+          
+          # 计算 Release Tag 名称
+          INPUT_TAG="${{ github.event.inputs.tag_name }}"
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="v1.0.$(date +'%Y%m%d')"
+          fi
+          
+          echo "RELEASE_TAG=$TAG" >> $GITHUB_ENV
+          echo "Building binaries for release tag: $TAG"
+          
+          PLATFORMS=(
+            "linux/amd64"
+            "linux/386"
+            "linux/arm64"
+            "linux/arm"
+            "linux/mipsle"
+            "linux/mips"
+            "windows/amd64"
+            "windows/arm64"
+            "darwin/amd64"
+            "darwin/arm64"
+          )
+          
+          for PLATFORM in "${PLATFORMS[@]}"
+          do
+            IFS="/" read -r -a SPLIT <<< "$PLATFORM"
+            GOOS=${SPLIT[0]}
+            GOARCH=${SPLIT[1]}
+            
+            OUTPUT_NAME="quicvpn_${GOOS}_${GOARCH}"
+            if [ "$GOOS" = "windows" ]; then
+              OUTPUT_NAME="${OUTPUT_NAME}.exe"
+            fi
+            
+            echo "Building $GOOS/$GOARCH with version $TAG..."
+            CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build \
+              -ldflags "-s -w -X main.version=${TAG}" \
+              -o "release_assets/$OUTPUT_NAME" .
+          done
+          
+          cd release_assets
+          sha256sum * > checksums.txt
+          ls -lh
+
+      - name: Extract Git Commits Log for Release Notes
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            echo "Extracting git log between $PREV_TAG and HEAD..."
+            CHANGELOG=$(git log --pretty=format:"* %s (%h)" --no-merges "${PREV_TAG}..HEAD")
+          else
+            echo "First release tag. Extracting full commit log..."
+            CHANGELOG=$(git log --pretty=format:"* %s (%h)" --no-merges)
+          fi
+
+          if [ -z "$CHANGELOG" ]; then
+            CHANGELOG="* Maintenance release and performance updates."
+          fi
+
+          cat << EOF > release_body.md
+          ## 🚀 quicvpn Release ${RELEASE_TAG}
+
+          High-performance, low-latency, anti-DPI VPN powered by QUIC, HTTP/3 ALPN camouflage, Reed-Solomon FEC, and Multi-Connection Bonding.
+
+          ### 📝 Commits Changelog (${PREV_TAG:-Initial Release} -> ${RELEASE_TAG})
+          ${CHANGELOG}
+
+          ---
+
+          ### 📦 Download Assets & Verify
+          Verify downloaded binaries using \`checksums.txt\`:
+          \`\`\`bash
+          sha256sum -c checksums.txt
+          \`\`\`
+
+          ### 🚀 Quick Start
+          **Server**:
+          \`\`\`bash
+          ./quicvpn_linux_amd64 -mode server -addr 0.0.0.0:4000 -psk "your_secret" -padding-mode block -fec-data 10 -fec-parity 2
+          \`\`\`
+
+          **Client**:
+          \`\`\`bash
+          ./quicvpn_linux_amd64 -mode client -addr 1.2.3.4:4000 -psk "your_secret" -conns 4 -fec-data 10 -fec-parity 2 -padding-mode block
+          \`\`\`
+          EOF
+
+      - name: Create GitHub Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: quicvpn ${{ env.RELEASE_TAG }}
+          body_path: release_body.md
+          files: |
+            release_assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

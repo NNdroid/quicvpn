@@ -4,8 +4,8 @@
 APP_NAME="quicvpn"
 # 輸出目錄
 OUTPUT_DIR="bin"
-# 版本號 (可選，預設為當前時間戳)
-VERSION=$(date +%Y%m%d_%H%M%S)
+# 版本號 (格式: v1.0.yyyyMMdd)
+VERSION="v1.0.$(date +%Y%m%d)"
 
 # 建立輸出目錄
 mkdir -p $OUTPUT_DIR
@@ -25,6 +25,10 @@ PLATFORMS=(
     "linux/arm"     # 嵌入式設備, 舊款樹莓派
     "linux/mipsle"  # 路由器常見架構 (Little Endian)
     "linux/mips"    # 路由器常見架構 (Big Endian)
+    "windows/amd64" # Windows x64
+    "windows/arm64" # Windows ARM64
+    "darwin/amd64"  # macOS (Intel)
+    "darwin/arm64"  # macOS (Apple Silicon M1/M2/M3/M4)
 )
 
 echo "Starting build process for $APP_NAME..."
@@ -38,14 +42,17 @@ do
     
     # 定義輸出檔案名稱
     OUTPUT_NAME="${APP_NAME}_${GOOS}_${GOARCH}"
+    if [ "$GOOS" = "windows" ]; then
+        OUTPUT_NAME="${OUTPUT_NAME}.exe"
+    fi
     
     # 執行編譯
     # CGO_ENABLED=0: 靜態編譯，不依賴系統 libc，提高移植性
     # -ldflags="-s -w": 壓縮體積，移除符號表和調試資訊
     echo "Building $PLATFORM..."
     env CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build \
-        -ldflags "-s -w" \
-        -o "$OUTPUT_DIR/$OUTPUT_NAME" *.go
+        -ldflags "-s -w -X main.version=${VERSION}" \
+        -o "$OUTPUT_DIR/$OUTPUT_NAME" .
 
     if [ $? -ne 0 ]; then
         echo "Error building $PLATFORM"

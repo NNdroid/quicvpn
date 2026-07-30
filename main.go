@@ -25,8 +25,6 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
-	"github.com/songgao/water"
-	"github.com/vishvananda/netlink"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -57,46 +55,146 @@ func fmtMAC(mac []byte) string {
 	return fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5])
 }
 
-// ======================= 内存池优化 (sync.Pool) =======================
-// framePool 提供 MTU 安全大小的字节切片，减少 GC 压力
-var framePool = sync.Pool{
-	New: func() any {
-		return make([]byte, 2048)
-	},
+// summarizeFrame 用于数据包以太网帧摘要解析与日志分析
+func summarizeFrame(frame []byte) string {
+	if len(frame) < 14 {
+		return fmt.Sprintf("Invalid Frame (len: %d)", len(frame))
+	}
+	dstMAC := frame[0:6]
+	srcMAC := frame[6:12]
+	etherType := binary.BigEndian.Uint16(frame[12:14])
+
+	if etherType == 0x0800 && len(frame) >= 34 { // IPv4
+		protoNum := frame[23]
+		srcIP := net.IP(frame[26:30]).String()
+		dstIP := net.IP(frame[30:34]).String()
+
+		protoStr := fmt.Sprintf("PROTO-%d", protoNum)
+		switch protoNum {
+		case 1:
+			protoStr = "ICMP"
+		case 6:
+			protoStr = "TCP"
+		case 17:
+			protoStr = "UDP"
+		}
+
+		return fmt.Sprintf("IPv4 | %s -> %s | [%s] %s -> %s",
+			fmtMAC(srcMAC), fmtMAC(dstMAC), protoStr, srcIP, dstIP)
+	}
+
+	if etherType == 0x86DD && len(frame) >= 54 { // IPv6
+		srcIP := net.IP(frame[22:38]).String()
+		dstIP := net.IP(frame[38:54]).String()
+		protoNum := frame[20]
+		return fmt.Sprintf("IPv6 | %s -> %s | [NextHeader-%s] %s -> %s",
+			fmtMAC(srcMAC), fmtMAC(dstMAC), protoStrFromNum(protoNum), srcIP, dstIP)
+	}
+
+	return fmt.Sprintf("Ethernet (Type: 0x%04x) | %s -> %s | len: %d",
+		etherType, fmtMAC(srcMAC), fmtMAC(dstMAC), len(frame))
 }
 
-// getFrame 从池中获取切片
-func getFrame() []byte {
-	return framePool.Get().([]byte)
-}
-
-// putFrame 用完后归还切片
-func putFrame(b []byte) {
-	if cap(b) >= 1500 && cap(b) <= 65536 {
-		framePool.Put(b[:cap(b)])
+func protoStrFromNum(n byte) string {
+	switch n {
+	case 1:
+		return "ICMP"
+	case 6:
+		return "TCP"
+	case 17:
+		return "UDP"
+	case 58:
+		return "ICMPv6"
+	default:
+		return fmt.Sprintf("PROTO-%d", n)
 	}
 }
 
-// ======================= 动态流量特征混淆 =======================
-// buildPaddedFrame 小包膨胀，中包加扰，大包放行 (Zero-allocation 填充)
-func buildPaddedFrame(buf []byte, rn int) []byte {
-	targetLen := rn
+// ======================= 内存池优化 (sync.Pool) =======================
+var framePool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 65536)
+		return &b
+	},
+}
 
-	if rn < 600 {
-		// 小于 600 的包：随机填充到 600 ~ 900 字节
-		targetLen = mathrand.Intn(301) + 600
-	} else if rn <= 900 {
-		// 600 到 900 的包：追加 64 ~ 256 字节的随机噪声长度
-		targetLen = rn + mathrand.Intn(193) + 64
+func getFrame() []byte {
+	ptr := framePool.Get().(*[]byte)
+	return (*ptr)[:65536]
+}
+
+func putFrame(b []byte) {
+	if cap(b) >= 1500 && cap(b) <= 65536 {
+		ptr := (*[]byte)(&b)
+		framePool.Put(ptr)
+	}
+}
+
+// ======================= 底层 UDP 套接字 8MB 内核 Tuning =======================
+func listenUDPWithBuffer(addrStr string, bufSize int) (*net.UDPConn, error) {
+	laddr, err := net.ResolveUDPAddr("udp", addrStr)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := net.ListenUDP("udp", laddr)
+	if err != nil {
+		return nil, err
+	}
+	if bufSize > 0 {
+		_ = conn.SetReadBuffer(bufSize)
+		_ = conn.SetWriteBuffer(bufSize)
+	}
+	return conn, nil
+}
+
+// ======================= 动态流量特征混淆引擎 =======================
+func buildPaddedFrame(buf []byte, rn int, mode string, step int, maxMTU int) []byte {
+	if mode == "off" || rn >= maxMTU {
+		frame := getFrame()[:rn]
+		copy(frame, buf[:rn])
+		return frame
+	}
+
+	targetLen := rn
+	switch mode {
+	case "block":
+		if step <= 0 {
+			step = 128
+		}
+		targetLen = ((rn + step - 1) / step) * step
+		if targetLen > maxMTU {
+			targetLen = maxMTU
+		}
+	case "mtu":
+		if maxMTU > rn {
+			targetLen = maxMTU
+		}
+	case "random":
+		jitter := mathrand.Intn(225) + 32
+		targetLen = rn + jitter
+		if targetLen > maxMTU {
+			targetLen = maxMTU
+		}
+	default:
+		if rn < 600 {
+			targetLen = mathrand.Intn(301) + 600
+		} else if rn <= 900 {
+			targetLen = rn + mathrand.Intn(193) + 64
+		}
+		if targetLen > maxMTU {
+			targetLen = maxMTU
+		}
+	}
+
+	if targetLen < rn {
+		targetLen = rn
 	}
 
 	frame := getFrame()[:targetLen]
 	copy(frame, buf[:rn])
 
 	if targetLen > rn {
-		for i := rn; i < targetLen; i++ {
-			frame[i] = 0 // QUIC 会将其加密为完美随机密文
-		}
+		clear(frame[rn:targetLen])
 	}
 
 	return frame
@@ -142,91 +240,14 @@ func getServerTLSConfig(certFile, keyFile string) *tls.Config {
 
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{"h3", "h3-29"}, // HTTP/3 伪装
+		NextProtos:   []string{"h3", "h3-29"},
 	}
 }
 
-// ======================= 策略路由 (纯 Netlink 实现) =======================
-func setupPolicyRouting(tapName string, mark int, gwV4, gwV6 string) error {
-	if mark <= 0 {
-		return nil
-	}
-	link, err := netlink.LinkByName(tapName)
-	if err != nil {
-		return fmt.Errorf("failed to find tap dev %s: %v", tapName, err)
-	}
-
-	setup := func(gwStr string, family int) {
-		if gwStr == "" {
-			return
-		}
-		gw := net.ParseIP(gwStr)
-
-		rule := netlink.NewRule()
-		rule.Mark = uint32(mark)
-		rule.Table = mark
-		rule.Family = family
-		netlink.RuleDel(rule)
-		if err := netlink.RuleAdd(rule); err != nil {
-			log.Warnf("Failed to add rule for fwmark %d: %v", mark, err)
-		}
-
-		route := &netlink.Route{
-			LinkIndex: link.Attrs().Index,
-			Dst:       nil,
-			Gw:        gw,
-			Table:     mark,
-		}
-		if err := netlink.RouteReplace(route); err != nil {
-			log.Warnf("Failed to replace route in table %d: %v", mark, err)
-		}
-	}
-
-	setup(gwV4, netlink.FAMILY_V4)
-	setup(gwV6, netlink.FAMILY_V6)
-	log.Infof("🔀 Policy routing configured (fwmark: %d)", mark)
-	return nil
-}
-
-func cleanPolicyRouting(tapName string, mark int, gwV4, gwV6 string) {
-	if mark <= 0 {
-		return
-	}
-	link, err := netlink.LinkByName(tapName)
-	if err != nil {
-		return
-	}
-
-	cleanup := func(gwStr string, family int) {
-		if gwStr == "" {
-			return
-		}
-		gw := net.ParseIP(gwStr)
-
-		rule := netlink.NewRule()
-		rule.Mark = uint32(mark)
-		rule.Table = mark
-		rule.Family = family
-		netlink.RuleDel(rule)
-
-		route := &netlink.Route{
-			LinkIndex: link.Attrs().Index,
-			Dst:       nil,
-			Gw:        gw,
-			Table:     mark,
-		}
-		netlink.RouteDel(route)
-	}
-
-	cleanup(gwV4, netlink.FAMILY_V4)
-	cleanup(gwV6, netlink.FAMILY_V6)
-	log.Infof("🧹 Policy routing cleaned (fwmark: %d)", mark)
-}
-
-// ======================= 流式帧扫描器 =======================
+// ======================= 高性能 O(1) 流式帧扫描器 =======================
 func writeStreamFrame(w io.Writer, frame []byte) error {
 	length := len(frame)
-	
+
 	streamBuf := getFrame()
 	defer putFrame(streamBuf)
 
@@ -240,7 +261,7 @@ func writeStreamFrame(w io.Writer, frame []byte) error {
 	if length > 0 {
 		copy(streamBuf[2:], frame)
 	}
-	
+
 	_, err := w.Write(streamBuf)
 	return err
 }
@@ -248,41 +269,49 @@ func writeStreamFrame(w io.Writer, frame []byte) error {
 type FrameScanner struct {
 	r   io.Reader
 	buf []byte
+	off int
 }
 
 func NewFrameScanner(r io.Reader) *FrameScanner {
 	return &FrameScanner{
 		r:   r,
 		buf: make([]byte, 0, 65536),
+		off: 0,
 	}
 }
 
 func (fs *FrameScanner) ReadFrame() ([]byte, error) {
 	for {
-		if len(fs.buf) >= 2 {
-			length := int(binary.BigEndian.Uint16(fs.buf[:2]))
+		avail := len(fs.buf) - fs.off
+		if avail >= 2 {
+			length := int(binary.BigEndian.Uint16(fs.buf[fs.off : fs.off+2]))
 
 			if length == 0 {
-				remaining := len(fs.buf) - 2
-				copy(fs.buf, fs.buf[2:])
-				fs.buf = fs.buf[:remaining]
+				fs.off += 2
 				continue
 			}
 
-			if length > 0 && length < 1600 {
-				if len(fs.buf) >= 2+length {
+			if length > 0 && length < 65000 {
+				if avail >= 2+length {
 					frame := getFrame()[:length]
-					copy(frame, fs.buf[2:2+length])
-
-					remaining := len(fs.buf) - (2 + length)
-					copy(fs.buf, fs.buf[2+length:])
-					fs.buf = fs.buf[:remaining]
+					copy(frame, fs.buf[fs.off+2:fs.off+2+length])
+					fs.off += 2 + length
 					return frame, nil
 				}
 			} else {
 				log.Warnf("[FrameScanner] CORRUPTION DETECTED: Invalid length %d.", length)
+				fs.off = 0
 				fs.buf = fs.buf[:0]
 			}
+		}
+
+		if fs.off > 0 {
+			remaining := len(fs.buf) - fs.off
+			if remaining > 0 {
+				copy(fs.buf[0:], fs.buf[fs.off:fs.off+remaining])
+			}
+			fs.buf = fs.buf[:remaining]
+			fs.off = 0
 		}
 
 		temp := getFrame()
@@ -291,34 +320,33 @@ func (fs *FrameScanner) ReadFrame() ([]byte, error) {
 			fs.buf = append(fs.buf, temp[:n]...)
 		}
 		putFrame(temp)
-		
+
 		if err != nil {
 			return nil, err
 		}
 	}
 }
 
-// 焦油坑主动探测伪装防御
 func camouflageProbe(stream *quic.Stream) {
 	defer stream.Close()
 	junkBuf := getFrame()
 	defer putFrame(junkBuf)
-	
+
 	deadline := time.Now().Add(10 * time.Second)
 	stream.SetReadDeadline(deadline)
 
 	for {
 		_, err := stream.Read(junkBuf)
 		if err != nil {
-			return 
+			return
 		}
 
 		time.Sleep(time.Duration(mathrand.Intn(150)+50) * time.Millisecond)
 
 		fakePayloadLen := mathrand.Intn(300) + 100
 		fakeFrame := getFrame()[:fakePayloadLen+2]
-		
-		fakeFrame[0] = 0x00 
+
+		fakeFrame[0] = 0x00
 		fakeFrame[1] = byte(fakePayloadLen)
 		rand.Read(fakeFrame[2:])
 
@@ -349,7 +377,10 @@ type HandshakeResp struct {
 	Padding string `json:"padding,omitempty"`
 }
 
+var version = "dev"
+
 func main() {
+	showVersion := flag.Bool("version", false, "Show version information and exit")
 	mode := flag.String("mode", "", "server or client")
 	psk := flag.String("psk", "quic_secret", "Pre-shared key")
 	tapName := flag.String("tap", "tap0", "Name of the TAP device")
@@ -366,29 +397,47 @@ func main() {
 	sni := flag.String("sni", "www.cloudflare.com", "SNI for TLS (Client only)")
 	insecure := flag.Bool("insecure", false, "Skip TLS verify (Client only)")
 	certHash := flag.String("cert-sha256", "", "Verify server cert SHA256 (hex encoded) (Client only)")
-	
+
 	fwmark := flag.Int("fwmark", 0, "Enable policy routing with specified fwmark (e.g. 1911) (Client only)")
 
+	// 性能、特征混淆、FEC、多连接 Bonding、8MB UDP Socket 及抗 AI 时序 Flag
+	paddingMode := flag.String("padding-mode", "block", "Padding mode: block, mtu, random, off")
+	paddingStep := flag.Int("padding-step", 128, "Block padding step size in bytes")
+	mtu := flag.Int("mtu", 1420, "Tunnel MTU size")
+	useDatagram := flag.Bool("datagram", true, "Enable QUIC Datagram mode for ultra performance")
+	conns := flag.Int("conns", 1, "Number of parallel QUIC connections for load balancing (Client only)")
+	fecData := flag.Int("fec-data", 0, "FEC data shards (e.g. 10, 0 to disable)")
+	fecParity := flag.Int("fec-parity", 0, "FEC parity shards (e.g. 2, 0 to disable)")
+	soBufSize := flag.Int("so-buf", 8388608, "UDP Socket SO_RCVBUF / SO_SNDBUF size in bytes (default 8MB)")
+	enableTimingShaping := flag.Bool("timing-shaping", true, "Enable microsecond Poisson timing shaping to bypass AI traffic classifiers")
+
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("quicvpn version %s\n", version)
+		os.Exit(0)
+	}
 	initLogger(*logLevel)
 	defer log.Sync()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	shaper := NewTimingShaper(*enableTimingShaping, 50)
+
 	if *mode == "server" {
-		startServer(ctx, *psk, *tapName, *addr, *v4cidr, *v6cidr, *certFile, *keyFile)
+		startServer(ctx, *psk, *tapName, *addr, *v4cidr, *v6cidr, *certFile, *keyFile, *paddingMode, *paddingStep, *mtu, *useDatagram, *fecData, *fecParity, *soBufSize, shaper)
 	} else if *mode == "client" {
-		startClient(ctx, *psk, *tapName, *addr, *reqV4, *reqV6, *sni, *insecure, *certHash, *fwmark)
+		startClient(ctx, *psk, *tapName, *addr, *reqV4, *reqV6, *sni, *insecure, *certHash, *fwmark, *paddingMode, *paddingStep, *mtu, *useDatagram, *conns, *fecData, *fecParity, *soBufSize, shaper)
 	} else {
 		fmt.Println("Usage: go run main.go -mode server|client [flags...]")
 		os.Exit(1)
 	}
-	
+
 	log.Info("Program exited gracefully.")
 }
 
-// ======================= VSwitch 虚拟交换机 =======================
+// ======================= VSwitch 虚拟交换机 (0内存分配 + 读写锁优化) =======================
 type Port interface {
 	ID() string
 	WriteFrame(frame []byte) error
@@ -402,13 +451,13 @@ type macEntry struct {
 type VSwitch struct {
 	mu       sync.RWMutex
 	ports    map[string]Port
-	macTable map[string]*macEntry
+	macTable map[[6]byte]macEntry
 }
 
 func NewVSwitch() *VSwitch {
 	return &VSwitch{
 		ports:    make(map[string]Port),
-		macTable: make(map[string]*macEntry),
+		macTable: make(map[[6]byte]macEntry),
 	}
 }
 
@@ -435,25 +484,34 @@ func (vs *VSwitch) ProcessFrame(srcPortID string, frame []byte) {
 	if len(frame) < 14 {
 		return
 	}
-	dstMAC := frame[0:6]
-	srcMAC := frame[6:12]
-	strDstMAC := string(dstMAC)
-	strSrcMAC := string(srcMAC)
+	var dstMAC, srcMAC [6]byte
+	copy(dstMAC[:], frame[0:6])
+	copy(srcMAC[:], frame[6:12])
 
-	vs.mu.Lock()
-	if _, exists := vs.macTable[strSrcMAC]; !exists {
-		log.Debugf("[VSwitch] Learned NEW MAC %s on port %s", fmtMAC(srcMAC), srcPortID)
+	now := time.Now()
+
+	vs.mu.RLock()
+	entry, srcExists := vs.macTable[srcMAC]
+	vs.mu.RUnlock()
+
+	if !srcExists || entry.portID != srcPortID || now.Sub(entry.updatedAt) > 10*time.Second {
+		vs.mu.Lock()
+		if _, exists := vs.macTable[srcMAC]; !exists {
+			log.Debugf("[VSwitch] Learned NEW MAC %s on port %s", fmtMAC(srcMAC[:]), srcPortID)
+		}
+		vs.macTable[srcMAC] = macEntry{portID: srcPortID, updatedAt: now}
+		vs.mu.Unlock()
 	}
-	vs.macTable[strSrcMAC] = &macEntry{portID: srcPortID, updatedAt: time.Now()}
 
 	isBUM := (dstMAC[0] & 1) == 1
 	var targetPortID string
 	if !isBUM {
-		if entry, exists := vs.macTable[strDstMAC]; exists {
-			targetPortID = entry.portID
+		vs.mu.RLock()
+		if dstEntry, dstExists := vs.macTable[dstMAC]; dstExists {
+			targetPortID = dstEntry.portID
 		}
+		vs.mu.RUnlock()
 	}
-	vs.mu.Unlock()
 
 	if targetPortID != "" {
 		if targetPortID != srcPortID {
@@ -487,7 +545,7 @@ func (vs *VSwitch) flood(excludePortID string, frame []byte) {
 	}
 }
 
-// ======================= 异步端口 =======================
+// ======================= 异步端口 (支持 Ring-Batching 批量刷新) =======================
 type AsyncPort struct {
 	id     string
 	ch     chan []byte
@@ -523,7 +581,7 @@ func (p *AsyncPort) WriteFrame(frame []byte) error {
 		buf = getFrame()[:len(frame)]
 		copy(buf, frame)
 	}
-	
+
 	select {
 	case p.ch <- buf:
 	default:
@@ -536,17 +594,33 @@ func (p *AsyncPort) WriteFrame(frame []byte) error {
 }
 
 func (p *AsyncPort) run() {
+	batch := make([][]byte, 0, 64)
 	for {
 		select {
 		case <-p.ctx.Done():
 			return
 		case frame := <-p.ch:
-			if err := p.writer(frame); err != nil {
-				log.Debugf("[AsyncPort %s] Writer returned error: %v", p.id, err)
+			batch = append(batch, frame)
+
+		drainLoop:
+			for len(batch) < 64 {
+				select {
+				case f := <-p.ch:
+					batch = append(batch, f)
+				default:
+					break drainLoop
+				}
 			}
-			if frame != nil {
-				putFrame(frame)
+
+			for _, f := range batch {
+				if err := p.writer(f); err != nil {
+					log.Debugf("[AsyncPort %s] Writer returned error: %v", p.id, err)
+				}
+				if f != nil {
+					putFrame(f)
+				}
 			}
+			batch = batch[:0]
 		}
 	}
 }
@@ -557,58 +631,65 @@ func (p *AsyncPort) Close() {
 
 // ======================= 服务端实现 =======================
 type Server struct {
-	psk     string
-	v4Net   *net.IPNet
-	v6Net   *net.IPNet
-	v4Gw    string 
-	v6Gw    string 
-	usedV4  map[string]bool
-	usedV6  map[string]bool
-	mu      sync.Mutex
-	tap     *water.Interface
-	vswitch *VSwitch
+	psk         string
+	v4Net       *net.IPNet
+	v6Net       *net.IPNet
+	v4Gw        string
+	v6Gw        string
+	usedV4      map[string]bool
+	usedV6      map[string]bool
+	mu          sync.Mutex
+	tap         io.ReadWriteCloser
+	vswitch     *VSwitch
+	paddingMode string
+	paddingStep int
+	mtu         int
+	useDatagram bool
+	fecData     int
+	fecParity   int
+	soBufSize   int
+	shaper      *TimingShaper
+	sessions    map[string]*ServerSession
 }
 
-func startServer(ctx context.Context, psk, tapName, addr, v4cidr, v6cidr, certFile, keyFile string) {
-	log.Infof("Starting QUIC server process... (HTTP/3 Camouflage Active)")
+func startServer(ctx context.Context, psk, tapName, addr, v4cidr, v6cidr, certFile, keyFile, paddingMode string, paddingStep, mtu int, useDatagram bool, fecData, fecParity, soBufSize int, shaper *TimingShaper) {
+	log.Infof("Starting QUIC server process... (HTTP/3 Camouflage, Padding: %s, FEC: %d:%d, SO_BUF: %dMB Active)", paddingMode, fecData, fecParity, soBufSize/(1024*1024))
 	_, v4net, _ := net.ParseCIDR(v4cidr)
 	_, v6net, _ := net.ParseCIDR(v6cidr)
 
 	srv := &Server{
-		psk:     psk,
-		v4Net:   v4net,
-		v6Net:   v6net,
-		usedV4:  make(map[string]bool),
-		usedV6:  make(map[string]bool),
-		vswitch: NewVSwitch(),
+		psk:         psk,
+		v4Net:       v4net,
+		v6Net:       v6net,
+		usedV4:      make(map[string]bool),
+		usedV6:      make(map[string]bool),
+		vswitch:     NewVSwitch(),
+		paddingMode: paddingMode,
+		paddingStep: paddingStep,
+		mtu:         mtu,
+		useDatagram: useDatagram,
+		fecData:     fecData,
+		fecParity:   fecParity,
+		soBufSize:   soBufSize,
+		shaper:      shaper,
+		sessions:    make(map[string]*ServerSession),
 	}
 
 	srvV4IP := getFirstIP(v4net)
 	srvV6IP := getFirstIP(v6net)
 	srv.v4Gw = srvV4IP.String()
 	srv.v6Gw = srvV6IP.String()
-	
+
 	srv.usedV4[srv.v4Gw] = true
 	srv.usedV6[srv.v6Gw] = true
 
-	config := water.Config{DeviceType: water.TAP}
-	config.Name = tapName
-	tap, err := water.New(config)
+	tap, actualTapName, err := createTAPDevice(tapName)
 	if err != nil {
 		log.Fatalf("Server TAP error: %v", err)
 	}
 	srv.tap = tap
 
-	if link, err := netlink.LinkByName(tapName); err == nil {
-		v4Addr, _ := netlink.ParseAddr(fmt.Sprintf("%s/%d", srv.v4Gw, maskSize(v4net.Mask)))
-		netlink.AddrReplace(link, v4Addr)
-
-		v6Addr, _ := netlink.ParseAddr(fmt.Sprintf("%s/%d", srv.v6Gw, maskSize(v6net.Mask)))
-		netlink.AddrReplace(link, v6Addr)
-
-		netlink.LinkSetUp(link)
-		log.Infof("Server TAP configured: IPv4=%s, IPv6=%s", v4Addr.String(), v6Addr.String())
-	} else {
+	if err := configureTAPInterface(actualTapName, srv.v4Gw, srv.v6Gw, v4net, v6net); err != nil {
 		log.Errorf("Failed to configure Server TAP interface: %v", err)
 	}
 
@@ -638,14 +719,14 @@ func startServer(ctx context.Context, psk, tapName, addr, v4cidr, v6cidr, certFi
 			default:
 				rn, err := srv.tap.Read(buf)
 				if err != nil {
-					if ctx.Err() != nil { return }
+					if ctx.Err() != nil {
+						return
+					}
 					log.Errorf("[Server Local] TAP Read error: %v", err)
 					return
 				}
-				
-				// 调用基于规则的特征混淆填充
-				frame := buildPaddedFrame(buf, rn)
-				
+
+				frame := buildPaddedFrame(buf, rn, srv.paddingMode, srv.paddingStep, srv.mtu)
 				srv.vswitch.ProcessFrame(tapPortID, frame)
 				putFrame(frame)
 			}
@@ -655,14 +736,21 @@ func startServer(ctx context.Context, psk, tapName, addr, v4cidr, v6cidr, certFi
 	quicConfig := &quic.Config{
 		KeepAlivePeriod: 15 * time.Second,
 		MaxIdleTimeout:  30 * time.Second,
+		EnableDatagrams: useDatagram,
 	}
 
 	tlsConfig := getServerTLSConfig(certFile, keyFile)
-	listener, err := quic.ListenAddr(addr, tlsConfig, quicConfig)
+
+	udpConn, err := listenUDPWithBuffer(addr, soBufSize)
+	if err != nil {
+		log.Fatalf("Failed to listen UDP with buffer tuning: %v", err)
+	}
+
+	listener, err := quic.Listen(udpConn, tlsConfig, quicConfig)
 	if err != nil {
 		log.Fatalf("QUIC Listen error: %v", err)
 	}
-	log.Infof("VPN Server listening on %s (Looks like standard HTTP/3 traffic)", addr)
+	log.Infof("VPN Server listening on %s (8MB SO_BUF Tuned & HTTP/3 Camouflaged)", addr)
 
 	go func() {
 		<-ctx.Done()
@@ -679,23 +767,19 @@ func startServer(ctx context.Context, psk, tapName, addr, v4cidr, v6cidr, certFi
 			log.Warnf("QUIC Accept error: %v", err)
 			continue
 		}
-		
+
 		go func(c *quic.Conn) {
 			stream, err := c.AcceptStream(ctx)
 			if err != nil {
 				log.Debugf("Failed to accept QUIC Stream: %v", err)
 				return
 			}
-			srv.handleClient(ctx, c, stream)
+			srv.handleClientConn(ctx, c, stream)
 		}(conn)
 	}
 }
 
-func (s *Server) handleClient(parentCtx context.Context, conn *quic.Conn, stream *quic.Stream) {
-	connCtx, cancel := context.WithCancel(parentCtx)
-	defer cancel()
-	defer conn.CloseWithError(0, "Closed intentionally")
-
+func (s *Server) handleClientConn(parentCtx context.Context, conn *quic.Conn, stream *quic.Stream) {
 	clientID := conn.RemoteAddr().String()
 	scanner := NewFrameScanner(stream)
 
@@ -719,51 +803,86 @@ func (s *Server) handleClient(parentCtx context.Context, conn *quic.Conn, stream
 
 	v4ip, v6ip := s.assignIPs(req.IPv4, req.IPv6)
 
-	defer func() {
-		s.mu.Lock()
-		delete(s.usedV4, v4ip)
-		delete(s.usedV6, v6ip)
-		s.mu.Unlock()
-		s.vswitch.RemovePort(clientID)
-	}()
-
 	v4cidr := fmt.Sprintf("%s/%d", v4ip, maskSize(s.v4Net.Mask))
 	v6cidr := fmt.Sprintf("%s/%d", v6ip, maskSize(s.v6Net.Mask))
-	
+
 	s.sendResp(stream, true, "OK", v4cidr, v6cidr)
-	
-	log.Infof("[%s] Tunnel established. Assigned V4: %s | V6: %s", clientID, v4cidr, v6cidr)
 
-	clientPort := NewAsyncPort(connCtx, clientID, func(b []byte) error {
-		return writeStreamFrame(stream, b)
-	})
-	s.vswitch.AddPort(clientPort)
-	defer clientPort.Close()
+	log.Infof("[%s] Tunnel connection established. Assigned V4: %s | V6: %s", clientID, v4cidr, v6cidr)
 
-	go func() {
-		for {
-			jitterDelay := time.Duration(mathrand.Intn(3000)+4000) * time.Millisecond
-			select {
-			case <-connCtx.Done():
-				return
-			case <-time.After(jitterDelay):
-				clientPort.WriteFrame(nil)
+	s.mu.Lock()
+	sess, exists := s.sessions[clientID]
+	if !exists {
+		sess = NewServerSession(parentCtx, clientID)
+		s.sessions[clientID] = sess
+
+		fecEnc, _ := NewFECEncoder(s.fecData, s.fecParity)
+		clientPort := NewAsyncPort(sess.ctx, clientID, func(b []byte) error {
+			if len(b) == 0 {
+				return sess.Send(b, s.useDatagram)
 			}
-		}
-	}()
+			s.shaper.Delay() // 抗 AI 时序塑形
+			if fecEnc != nil {
+				encodedShards := fecEnc.Input(b)
+				for _, shard := range encodedShards {
+					_ = sess.Send(shard, s.useDatagram)
+					putFrame(shard)
+				}
+				return nil
+			}
+			return sess.Send(b, s.useDatagram)
+		})
+		s.vswitch.AddPort(clientPort)
+
+		go func() {
+			<-sess.ctx.Done()
+			s.mu.Lock()
+			delete(s.sessions, clientID)
+			s.usedV4[v4ip] = false
+			s.usedV6[v6ip] = false
+			s.mu.Unlock()
+			s.vswitch.RemovePort(clientID)
+		}()
+	}
+	sess.AddConn(conn, stream)
+	s.mu.Unlock()
+
+	fecDec := NewFECDecoder()
+
+	// Datagram 接收处理协程
+	if s.useDatagram {
+		go func() {
+			for {
+				data, err := conn.ReceiveDatagram(sess.ctx)
+				if err != nil {
+					return
+				}
+				if len(data) > 0 {
+					frames := fecDec.Input(data)
+					for _, frame := range frames {
+						s.vswitch.ProcessFrame(clientID, frame)
+						putFrame(frame)
+					}
+				}
+			}
+		}()
+	}
 
 	for {
 		select {
-		case <-connCtx.Done():
+		case <-sess.ctx.Done():
 			return
 		default:
-			frame, err := scanner.ReadFrame()
+			pkt, err := scanner.ReadFrame()
 			if err != nil {
-				log.Debugf("[%s] Tunnel stream closed: %v", clientID, err)
 				return
 			}
-			s.vswitch.ProcessFrame(clientID, frame)
-			putFrame(frame)
+			frames := fecDec.Input(pkt)
+			putFrame(pkt)
+			for _, frame := range frames {
+				s.vswitch.ProcessFrame(clientID, frame)
+				putFrame(frame)
+			}
 		}
 	}
 }
@@ -794,37 +913,44 @@ func (s *Server) assignIPs(reqV4, reqV6 string) (string, string) {
 
 func (s *Server) sendResp(w io.Writer, ok bool, msg, v4cidr, v6cidr string) {
 	d, _ := json.Marshal(HandshakeResp{
-		Success: ok, 
-		Message: msg, 
-		IPv4:    v4cidr, 
+		Success: ok,
+		Message: msg,
+		IPv4:    v4cidr,
 		IPv6:    v6cidr,
-		GwV4:    s.v4Gw, 
+		GwV4:    s.v4Gw,
 		GwV6:    s.v6Gw,
-		Padding: generatePadding(100, 500), 
+		Padding: generatePadding(100, 500),
 	})
 	writeStreamFrame(w, d)
 }
 
 // ======================= 客户端实现 =======================
 type Client struct {
-	psk        string
-	serverAddr string
-	tapName    string
-	reqV4      string
-	reqV6      string
-	sni        string
-	insecure   bool
-	certHash   string
-	fwmark     int
-	tap        *water.Interface
-	tapTxChan  chan []byte
+	psk         string
+	serverAddr  string
+	tapName     string
+	reqV4       string
+	reqV6       string
+	sni         string
+	insecure    bool
+	certHash    string
+	fwmark      int
+	tap         io.ReadWriteCloser
+	tapTxChan   chan []byte
+	paddingMode string
+	paddingStep int
+	mtu         int
+	useDatagram bool
+	numConns    int
+	fecData     int
+	fecParity   int
+	soBufSize   int
+	shaper      *TimingShaper
 }
 
-func startClient(ctx context.Context, psk, tapName, addr, reqV4, reqV6, sni string, insecure bool, certHash string, fwmark int) {
-	log.Infof("Starting QUIC client process... (HTTP/3 Camouflage Active)")
-	config := water.Config{DeviceType: water.TAP}
-	config.Name = tapName
-	iface, err := water.New(config)
+func startClient(ctx context.Context, psk, tapName, addr, reqV4, reqV6, sni string, insecure bool, certHash string, fwmark int, paddingMode string, paddingStep, mtu int, useDatagram bool, numConns, fecData, fecParity, soBufSize int, shaper *TimingShaper) {
+	log.Infof("Starting QUIC client process... (HTTP/3 Camouflage, Padding: %s, Conns: %d, FEC: %d:%d, SO_BUF: %dMB Active)", paddingMode, numConns, fecData, fecParity, soBufSize/(1024*1024))
+	iface, actualTapName, err := createTAPDevice(tapName)
 	if err != nil {
 		log.Fatalf("Client TAP creation error: %v", err)
 	}
@@ -836,20 +962,28 @@ func startClient(ctx context.Context, psk, tapName, addr, reqV4, reqV6, sni stri
 	}()
 
 	c := &Client{
-		psk:        psk,
-		serverAddr: addr,
-		tapName:    tapName,
-		reqV4:      reqV4,
-		reqV6:      reqV6,
-		sni:        sni,
-		insecure:   insecure,
-		certHash:   certHash,
-		fwmark:     fwmark,
-		tap:        iface,
-		tapTxChan:  make(chan []byte, 4096),
+		psk:         psk,
+		serverAddr:  addr,
+		tapName:     actualTapName,
+		reqV4:       reqV4,
+		reqV6:       reqV6,
+		sni:         sni,
+		insecure:    insecure,
+		certHash:    certHash,
+		fwmark:      fwmark,
+		tap:         iface,
+		tapTxChan:   make(chan []byte, 4096),
+		paddingMode: paddingMode,
+		paddingStep: paddingStep,
+		mtu:         mtu,
+		useDatagram: useDatagram,
+		numConns:    numConns,
+		fecData:     fecData,
+		fecParity:   fecParity,
+		soBufSize:   soBufSize,
+		shaper:      shaper,
 	}
 
-	// 客户端唯一常驻读取协程
 	go func() {
 		buf := make([]byte, 65536)
 		for {
@@ -862,9 +996,8 @@ func startClient(ctx context.Context, psk, tapName, addr, reqV4, reqV6, sni stri
 				time.Sleep(1 * time.Second)
 				continue
 			}
-			
-			// 调用基于规则的特征混淆填充
-			frame := buildPaddedFrame(buf, rn)
+
+			frame := buildPaddedFrame(buf, rn, c.paddingMode, c.paddingStep, c.mtu)
 
 			select {
 			case <-ctx.Done():
@@ -920,85 +1053,183 @@ func (c *Client) dialAndServe(parentCtx context.Context) error {
 
 	quicConfig := &quic.Config{
 		KeepAlivePeriod: 15 * time.Second,
-		MaxIdleTimeout:  30 * time.Second, 
+		MaxIdleTimeout:  30 * time.Second,
+		EnableDatagrams: c.useDatagram,
 	}
 
-	log.Infof("Initiating connection to Server: %s (SNI: %s)", c.serverAddr, c.sni)
-	
-	dialCtx, dialCancel := context.WithTimeout(runCtx, 5*time.Second)
-	conn, err := quic.DialAddr(dialCtx, c.serverAddr, tlsConf, quicConfig)
-	dialCancel()
-	
-	if err != nil {
-		return fmt.Errorf("QUIC dial failed: %v", err)
-	}
-	defer conn.CloseWithError(0, "Client closed")
-	
-	log.Infof("Encrypted transport established to %s.", c.serverAddr)
-
-	stream, err := conn.OpenStreamSync(runCtx)
-	if err != nil {
-		return fmt.Errorf("failed to open QUIC stream: %v", err)
+	numConns := c.numConns
+	if numConns <= 0 {
+		numConns = 1
 	}
 
-	scanner := NewFrameScanner(stream)
+	pool := NewClientConnPool()
+	defer pool.Close()
 
-	req := HandshakeReq{
-		PSK:     c.psk, 
-		IPv4:    c.reqV4, 
-		IPv6:    c.reqV6,
-		Padding: generatePadding(100, 500), 
-	}
-	reqData, _ := json.Marshal(req)
-	if err := writeStreamFrame(stream, reqData); err != nil {
-		return fmt.Errorf("failed to send handshake: %v", err)
-	}
+	var firstResp HandshakeResp
 
-	stream.SetReadDeadline(time.Now().Add(5 * time.Second))
-	respData, err := scanner.ReadFrame()
-	if err != nil {
-		return fmt.Errorf("handshake read error: %v", err)
-	}
-	stream.SetReadDeadline(time.Time{})
+	for i := 0; i < numConns; i++ {
+		udpConn, err := listenUDPWithBuffer("0.0.0.0:0", c.soBufSize)
+		if err != nil {
+			return fmt.Errorf("failed to listen UDP for client conn #%d: %v", i+1, err)
+		}
 
-	var resp HandshakeResp
-	if err := json.Unmarshal(respData, &resp); err != nil || !resp.Success {
+		remoteAddr, err := net.ResolveUDPAddr("udp", c.serverAddr)
+		if err != nil {
+			udpConn.Close()
+			return fmt.Errorf("failed to resolve server addr: %v", err)
+		}
+
+		dialCtx, dialCancel := context.WithTimeout(runCtx, 5*time.Second)
+		conn, err := quic.Dial(dialCtx, udpConn, remoteAddr, tlsConf, quicConfig)
+		dialCancel()
+
+		if err != nil {
+			udpConn.Close()
+			return fmt.Errorf("QUIC dial failed for conn #%d: %v", i+1, err)
+		}
+
+		stream, err := conn.OpenStreamSync(runCtx)
+		if err != nil {
+			conn.CloseWithError(0, "Stream open error")
+			return fmt.Errorf("failed to open QUIC stream #%d: %v", i+1, err)
+		}
+
+		scanner := NewFrameScanner(stream)
+
+		req := HandshakeReq{
+			PSK:     c.psk,
+			IPv4:    c.reqV4,
+			IPv6:    c.reqV6,
+			Padding: generatePadding(100, 500),
+		}
+		reqData, _ := json.Marshal(req)
+		if err := writeStreamFrame(stream, reqData); err != nil {
+			conn.CloseWithError(0, "Handshake write error")
+			return fmt.Errorf("failed to send handshake #%d: %v", i+1, err)
+		}
+
+		stream.SetReadDeadline(time.Now().Add(5 * time.Second))
+		respData, err := scanner.ReadFrame()
+		if err != nil {
+			conn.CloseWithError(0, "Handshake read error")
+			return fmt.Errorf("handshake read error #%d: %v", i+1, err)
+		}
+		stream.SetReadDeadline(time.Time{})
+
+		var resp HandshakeResp
+		if err := json.Unmarshal(respData, &resp); err != nil || !resp.Success {
+			putFrame(respData)
+			conn.CloseWithError(0, "Handshake rejected")
+			return fmt.Errorf("handshake failed #%d: %v", i+1, err)
+		}
 		putFrame(respData)
-		return fmt.Errorf("handshake failed/rejected: %v", err)
+
+		if i == 0 {
+			firstResp = resp
+		}
+		pool.Add(conn, stream)
 	}
-	putFrame(respData)
 
-	log.Infof("Tunnel negotiated! IPv4: %s (GW: %s) | IPv6: %s (GW: %s)", resp.IPv4, resp.GwV4, resp.IPv6, resp.GwV6)
+	log.Infof("Tunnel negotiated across %d connections! IPv4: %s (GW: %s) | IPv6: %s (GW: %s)", pool.Size(), firstResp.IPv4, firstResp.GwV4, firstResp.IPv6, firstResp.GwV6)
 
-	if err := c.setupInterface(resp.IPv4, resp.IPv6); err != nil {
+	if err := c.setupInterface(firstResp.IPv4, firstResp.IPv6); err != nil {
 		return fmt.Errorf("TAP interface setup failed: %v", err)
 	}
 
-	if err := setupPolicyRouting(c.tapName, c.fwmark, resp.GwV4, resp.GwV6); err != nil {
+	if err := setupPolicyRouting(c.tapName, c.fwmark, firstResp.GwV4, firstResp.GwV6); err != nil {
 		log.Warnf("Policy routing setup failed: %v", err)
 	}
-	defer cleanPolicyRouting(c.tapName, c.fwmark, resp.GwV4, resp.GwV6)
+	defer cleanPolicyRouting(c.tapName, c.fwmark, firstResp.GwV4, firstResp.GwV6)
 
-	errChan := make(chan error, 2)
+	errChan := make(chan error, 4)
+	fecDec := NewFECDecoder()
+	fecEnc, _ := NewFECEncoder(c.fecData, c.fecParity)
 
+	// Datagram 与 Stream 接收
+	pool.mu.RLock()
+	for idx, conn := range pool.conns {
+		st := pool.streams[idx]
+		cRef := conn
+		stRef := st
+
+		if c.useDatagram {
+			go func(cn *quic.Conn) {
+				for {
+					data, err := cn.ReceiveDatagram(runCtx)
+					if err != nil {
+						return
+					}
+					if len(data) > 0 {
+						frames := fecDec.Input(data)
+						for _, frame := range frames {
+							if _, err := c.tap.Write(frame); err != nil {
+								log.Errorf("[Rx-Datagram] TAP Write Error: %v", err)
+							}
+							putFrame(frame)
+						}
+					}
+				}
+			}(cRef)
+		}
+
+		go func(st *quic.Stream) {
+			sc := NewFrameScanner(st)
+			for {
+				select {
+				case <-runCtx.Done():
+					return
+				default:
+					pkt, err := sc.ReadFrame()
+					if err != nil {
+						errChan <- err
+						return
+					}
+					frames := fecDec.Input(pkt)
+					putFrame(pkt)
+					for _, frame := range frames {
+						if _, err := c.tap.Write(frame); err != nil {
+							log.Errorf("[Rx-Stream] TAP Write Error: %v", err)
+						}
+						putFrame(frame)
+					}
+				}
+			}
+		}(stRef)
+	}
+	pool.mu.RUnlock()
+
+	// 发送协程
 	go func() {
 		for {
 			jitterDelay := time.Duration(mathrand.Intn(3000)+4000) * time.Millisecond
-			
+
 			select {
 			case <-runCtx.Done():
 				return
-			case frame := <-c.tapTxChan: 
-				err := writeStreamFrame(stream, frame)
-				putFrame(frame)
-				if err != nil {
-					log.Debugf("[Tx] QUIC Write Error: %v", err)
-					errChan <- err
-					return
+			case frame := <-c.tapTxChan:
+				c.shaper.Delay() // 抗 AI 时序塑造
+
+				if fecEnc != nil {
+					shards := fecEnc.Input(frame)
+					putFrame(frame)
+					for _, shard := range shards {
+						err := pool.SendDatagramOrStream(shard, c.useDatagram)
+						putFrame(shard)
+						if err != nil {
+							errChan <- err
+							return
+						}
+					}
+				} else {
+					err := pool.SendDatagramOrStream(frame, c.useDatagram)
+					putFrame(frame)
+					if err != nil {
+						errChan <- err
+						return
+					}
 				}
 			case <-time.After(jitterDelay):
-				if err := writeStreamFrame(stream, nil); err != nil {
-					log.Debugf("[Tx] Keep-alive Write Error: %v", err)
+				if err := pool.SendDatagramOrStream(nil, c.useDatagram); err != nil {
 					errChan <- err
 					return
 				}
@@ -1006,32 +1237,8 @@ func (c *Client) dialAndServe(parentCtx context.Context) error {
 		}
 	}()
 
-	go func() {
-		for {
-			select {
-			case <-runCtx.Done():
-				return
-			default:
-				frame, err := scanner.ReadFrame()
-				if err != nil {
-					log.Debugf("[Rx] Tunnel stream closed: %v", err)
-					errChan <- err
-					return
-				}
-				
-				if _, err := c.tap.Write(frame); err != nil {
-					log.Errorf("[Rx] TAP Write Error: %v", err)
-					putFrame(frame)
-					errChan <- err
-					return
-				}
-				putFrame(frame)
-			}
-		}
-	}()
+	log.Infof("QUIC Tunnel Data Plane Active (%d Conns Bonding, SO_BUF: %dMB).", pool.Size(), c.soBufSize/(1024*1024))
 
-	log.Infof("QUIC Tunnel Data Plane Active.")
-	
 	select {
 	case err := <-errChan:
 		return err
@@ -1041,22 +1248,21 @@ func (c *Client) dialAndServe(parentCtx context.Context) error {
 }
 
 func (c *Client) setupInterface(v4cidr, v6cidr string) error {
-	link, err := netlink.LinkByName(c.tapName)
-	if err != nil {
-		return err
-	}
+	v4Net, v6Net := parseCIDRHelper(v4cidr, v6cidr)
+	v4IP := strings.Split(v4cidr, "/")[0]
+	v6IP := strings.Split(v6cidr, "/")[0]
+	return configureTAPInterface(c.tapName, v4IP, v6IP, v4Net, v6Net)
+}
 
-	if v4cidr != "/" && v4cidr != "" {
-		if addrV4, err := netlink.ParseAddr(v4cidr); err == nil {
-			netlink.AddrReplace(link, addrV4)
-		}
+func parseCIDRHelper(v4cidr, v6cidr string) (*net.IPNet, *net.IPNet) {
+	var v4n, v6n *net.IPNet
+	if v4cidr != "" && v4cidr != "/" {
+		_, v4n, _ = net.ParseCIDR(v4cidr)
 	}
-	if v6cidr != "/" && v6cidr != "" {
-		if addrV6, err := netlink.ParseAddr(v6cidr); err == nil {
-			netlink.AddrReplace(link, addrV6)
-		}
+	if v6cidr != "" && v6cidr != "/" {
+		_, v6n, _ = net.ParseCIDR(v6cidr)
 	}
-	return netlink.LinkSetUp(link)
+	return v4n, v6n
 }
 
 func incrementIP(ip net.IP) {
